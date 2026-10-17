@@ -76,8 +76,9 @@
 								"{{identityProviderUrl}}"
 							],
 							"path": [
-								"oauth",
-								"token"
+								"api",
+									"v1",
+									"authorize"
 							]
 						}
 					},
