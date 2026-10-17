@@ -32,7 +32,8 @@ public class SecurityConfig {
             @Value("${OIDC_AUDIENCE:library-api}") String audience) {
         NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(jwks).build();
         OAuth2TokenValidator<Jwt> claims = jwt -> {
-            if (jwt.getExpiresAt() == null || jwt.getSubject() == null || jwt.getSubject().isBlank()
+            if (jwt.getExpiresAt() == null || jwt.getClaimAsString("preferred_username") == null
+                    || jwt.getClaimAsString("preferred_username").isBlank()
                     || !jwt.getAudience().contains(audience)) {
                 return OAuth2TokenValidatorResult.failure(
                     new OAuth2Error("invalid_token", "Required token claims are invalid", null));
