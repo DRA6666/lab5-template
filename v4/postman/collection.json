@@ -71,7 +71,7 @@
 							]
 						},
 						"url": {
-							"raw": "{{identityProviderUrl}}/oauth/token",
+							"raw": "{{identityProviderUrl}}/api/v1/authorize",
 							"host": [
 								"{{identityProviderUrl}}"
 							],

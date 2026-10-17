@@ -1,0 +1,330 @@
+package ru.rsoi.gateway.controller;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.client.RestClient;
+import ru.rsoi.gateway.dto.ReturnBookRequest;
+import ru.rsoi.gateway.dto.TakeBookRequest;
+
+import java.time.LocalDate;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+@RestController
+@RequestMapping("/api/v1")
+public class GatewayController {
+
+    private final RestClient client;
+
+    @Value("${rating-url}")      private String ratingUrl;
+    @Value("${library-url}")     private String libraryUrl;
+    @Value("${reservation-url}") private String reservationUrl;
+
+    /**
+     * Накопленные изменения рейтинга, которые не удалось применить,
+     * потому что rating-service был недоступен.
+     * username -> суммарная delta (обычно +1 за возврат, -10 за просрочку/плохое состояние)
+     */
+    private final Map<String, Integer> pendingDeltas = new ConcurrentHashMap<>();
+
+    public GatewayController(RestClient client) { this.client = client; }
+
+    // ---------- Libraries ----------
+    @GetMapping("/libraries")
+    public ResponseEntity<Object> libraries(@RequestParam("city") String city,
+                                            @RequestParam(value = "page", defaultValue = "1") int page,
+                                            @RequestParam(value = "size", defaultValue = "10") int size) {
+        Object body = client.get()
+                .uri(libraryUrl + "/api/v1/libraries?city={c}&page={p}&size={s}", city, page, size)
+                .retrieve().body(Object.class);
+        return ResponseEntity.ok(body);
+    }
+
+    @GetMapping("/libraries/{libraryUid}/books")
+    public ResponseEntity<Object> books(@PathVariable String libraryUid,
+                                        @RequestParam(value = "page", defaultValue = "1") int page,
+                                        @RequestParam(value = "size", defaultValue = "25") int size,
+                                        @RequestParam(value = "showAll", defaultValue = "false") boolean showAll) {
+        Object body = client.get()
+                .uri(libraryUrl + "/api/v1/libraries/{u}/books?page={p}&size={s}&showAll={a}",
+                        libraryUid, page, size, showAll)
+                .retrieve().body(Object.class);
+        return ResponseEntity.ok(body);
+    }
+
+    // ---------- Rating ----------
+    @GetMapping("/rating")
+    @SuppressWarnings("unchecked")
+    public ResponseEntity<?> rating(@AuthenticationPrincipal(expression = "claims['preferred_username'] ?: subject") String username) {
+        Object body;
+        try {
+            body = client.get().uri(ratingUrl + "/api/v1/rating")
+                    .retrieve().body(Object.class);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+        if (body == null) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+
+        // Применяем накопленные delta, если они есть
+        Integer pending = pendingDeltas.get(username);
+        if (pending != null && pending != 0 && body instanceof Map) {
+            Map<String, Object> m = (Map<String, Object>) body;
+            Object starsObj = m.get("stars");
+            if (starsObj instanceof Number) {
+                int stars = ((Number) starsObj).intValue() + pending;
+                m.put("stars", stars);
+
+                // пытаемся "сбросить" pending в rating, если он доступен
+                try {
+                    client.post().uri(ratingUrl + "/api/v1/rating?delta={d}", pending)
+                            .retrieve().toBodilessEntity();
+                    pendingDeltas.remove(username);
+                } catch (Exception ignored) {
+                    // rating всё ещё недоступен — оставляем pending как есть
+                }
+            }
+        }
+
+        return ResponseEntity.ok(body);
+    }
+
+    // ---------- Reservations list ----------
+    @GetMapping("/reservations")
+    public ResponseEntity<?> listReservations(@AuthenticationPrincipal(expression = "claims['preferred_username'] ?: subject") String username) {
+        List<Map<String, Object>> rows;
+        try {
+            rows = client.get()
+                    .uri(reservationUrl + "/api/v1/reservations")
+                    .retrieve()
+                    .body(new ParameterizedTypeReference<>() {});
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("message", "Reservation Service unavailable"));
+        }
+
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (rows != null) {
+            for (Map<String, Object> r : rows) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("reservationUid", r.get("reservationUid"));
+                item.put("status", r.get("status"));
+                item.put("startDate", r.get("startDate"));
+                item.put("tillDate", r.get("tillDate"));
+
+                Map<String, Object> book = fetchMap(libraryUrl + "/api/v1/books/" + r.get("bookUid"));
+                Map<String, Object> library = fetchMap(libraryUrl + "/api/v1/libraries/" + r.get("libraryUid"));
+
+                if (book != null) {
+                    item.put("book", extractBook(book));
+                } else {
+                    Map<String, Object> fallbackBook = new LinkedHashMap<>();
+                    fallbackBook.put("bookUid", r.get("bookUid"));
+                    item.put("book", fallbackBook);
+                }
+                if (library != null) {
+                    item.put("library", extractLibrary(library));
+                } else {
+                    Map<String, Object> fallbackLib = new LinkedHashMap<>();
+                    fallbackLib.put("libraryUid", r.get("libraryUid"));
+                    item.put("library", fallbackLib);
+                }
+                out.add(item);
+            }
+        }
+        return ResponseEntity.ok(out);
+    }
+
+    // ---------- Take book ----------
+    @PostMapping("/reservations")
+    public ResponseEntity<?> takeBook(@AuthenticationPrincipal(expression = "claims['preferred_username'] ?: subject") String username,
+                                      @RequestBody TakeBookRequest req) {
+        // 1. rating
+        Map<String, Object> rating;
+        try {
+            rating = client.get().uri(ratingUrl + "/api/v1/rating")
+                    .retrieve().body(new ParameterizedTypeReference<>() {});
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+        if (rating == null || rating.get("stars") == null) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+        int stars = ((Number) rating.get("stars")).intValue();
+
+        // 2. active reservations
+        Long active;
+        try {
+            active = client.get().uri(reservationUrl + "/api/v1/reservations/count-active")
+                    .retrieve().body(Long.class);
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+        long rented = active == null ? 0 : active;
+
+        if (rented >= stars) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                    .body(Map.of("message", "User cannot take more books"));
+        }
+
+        // 3. reserve in library
+        ResponseEntity<Void> reserve;
+        try {
+            reserve = client.post()
+                    .uri(libraryUrl + "/api/v1/libraries/{l}/books/{b}/reserve", req.libraryUid(), req.bookUid())
+                    .retrieve().toBodilessEntity();
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+        if (reserve.getStatusCode().isError()) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("message", "Book is not available"));
+        }
+
+        // 4. create reservation
+        Map<String, Object> createBody = new LinkedHashMap<>();
+        createBody.put("bookUid", req.bookUid());
+        createBody.put("libraryUid", req.libraryUid());
+        createBody.put("tillDate", req.tillDate());
+
+        Map<String, Object> reservation;
+        try {
+            reservation = client.post()
+                    .uri(reservationUrl + "/api/v1/reservations")
+                    .body(createBody)
+                    .retrieve().body(new ParameterizedTypeReference<>() {});
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+        if (reservation == null) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+
+        // 5. enrich
+        Map<String, Object> book = fetchMap(libraryUrl + "/api/v1/books/" + req.bookUid());
+        Map<String, Object> library = fetchMap(libraryUrl + "/api/v1/libraries/" + req.libraryUid());
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("reservationUid", reservation.get("reservationUid"));
+        response.put("status", reservation.get("status"));
+        response.put("startDate", reservation.get("startDate"));
+        response.put("tillDate", reservation.get("tillDate"));
+        response.put("book", extractBook(book));
+        response.put("library", extractLibrary(library));
+        response.put("rating", Map.of("stars", stars));
+        return ResponseEntity.ok(response);
+    }
+
+    // ---------- Return book ----------
+    @PostMapping("/reservations/{reservationUid}/return")
+    public ResponseEntity<?> returnBook(@AuthenticationPrincipal(expression = "claims['preferred_username'] ?: subject") String username,
+                                        @PathVariable String reservationUid,
+                                        @RequestBody ReturnBookRequest req) {
+
+        // find reservation
+        List<Map<String, Object>> rows;
+        try {
+            rows = client.get()
+                    .uri(reservationUrl + "/api/v1/reservations")
+                    .retrieve().body(new ParameterizedTypeReference<>() {});
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+
+        Map<String, Object> current = null;
+        if (rows != null) {
+            for (Map<String, Object> r : rows) {
+                if (reservationUid.equals(r.get("reservationUid"))) { current = r; break; }
+            }
+        }
+        if (current == null) return ResponseEntity.notFound().build();
+
+        // original condition
+        Map<String, Object> book = fetchMap(libraryUrl + "/api/v1/books/" + current.get("bookUid"));
+        String originalCondition = book == null ? null : (String) book.get("condition");
+
+        // return in reservation
+        Map<String, Object> returnBody = new LinkedHashMap<>();
+        returnBody.put("condition", req.condition());
+        returnBody.put("date", req.date());
+        try {
+            client.post().uri(reservationUrl + "/api/v1/reservations/{u}/return", reservationUid)
+                    .body(returnBody)
+                    .retrieve().toBodilessEntity();
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("message", "Bonus Service unavailable"));
+        }
+
+        // return in library — игнорируем ошибку (не критично)
+        try {
+            client.post().uri(libraryUrl + "/api/v1/libraries/{l}/books/{b}/return",
+                            current.get("libraryUid"), current.get("bookUid"))
+                    .retrieve().toBodilessEntity();
+        } catch (Exception ignored) {}
+
+        // rating recalculation
+        LocalDate till = LocalDate.parse((String) current.get("tillDate"));
+        boolean late = req.date() != null && req.date().isAfter(till);
+        boolean badCondition = originalCondition != null && !originalCondition.equals(req.condition());
+        int delta = (late || badCondition) ? -10 : 1;
+
+        boolean applied = false;
+        try {
+            client.post().uri(ratingUrl + "/api/v1/rating?delta={d}", delta)
+                    .retrieve().toBodilessEntity();
+            applied = true;
+        } catch (Exception ignored) {
+            // rating недоступен — копим delta
+        }
+
+        if (!applied) {
+            pendingDeltas.merge(username, delta, Integer::sum);
+        }
+
+        return ResponseEntity.noContent().build();
+    }
+
+    // ---------- helpers ----------
+    private Map<String, Object> fetchMap(String url) {
+        try {
+            return client.get().uri(url).retrieve().body(new ParameterizedTypeReference<>() {});
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Map<String, Object> extractBook(Map<String, Object> book) {
+        if (book == null) return new LinkedHashMap<>();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("bookUid", book.get("bookUid"));
+        out.put("name", book.get("name"));
+        out.put("author", book.get("author"));
+        out.put("genre", book.get("genre"));
+        return out;
+    }
+
+    private Map<String, Object> extractLibrary(Map<String, Object> library) {
+        if (library == null) return new LinkedHashMap<>();
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("libraryUid", library.get("libraryUid"));
+        out.put("name", library.get("name"));
+        out.put("address", library.get("address"));
+        out.put("city", library.get("city"));
+        return out;
+    }
+}

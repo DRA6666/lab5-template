@@ -1234,3 +1234,13 @@ buildNumber.properties
 .mvn/timing.properties
 # https://github.com/takari/maven-wrapper#usage-without-binary-jar
 .mvn/wrapper/maven-wrapper.jar
+
+# Local reference checkout and build artifacts
+/lab4-source/
+**/target/
+/.env
+/test-results/
+!/scripts/
+!/scripts/**
+/scripts/implement_lab5.py
+/scripts/create_security_tests.py

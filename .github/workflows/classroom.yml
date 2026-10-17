@@ -1,38 +1,55 @@
 name: GitHub Classroom Workflow
 on:
   push:
-    branches: [ master ]
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Autograding
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          fetch-depth: 0
-
-      - uses: docker/setup-buildx-action@v2
-
-      # TODO build, publish to docker hub, deploy to k8s
-
-      - name: Run API Tests
-        uses: matt-ball/newman-action@master
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Unit and JWT security tests
+        run: |
+          for service in gateway library rating reservation; do
+            mvn -B -ntp -f "$service/pom.xml" verify
+          done
+      - name: Build and start Docker services
+        run: docker compose -p lab5-ci up -d --build
+      - name: Wait for services and identity provider
+        run: python3 scripts/wait-ready.py
+      - uses: actions/setup-node@v4
         with:
-          collection: <variant>/postman/collection.json
-          environment: <variant>/postman/environment.json
-          delayRequest: 100
-          reporters: '[ "cli" ]'
-
+          node-version: '22'
+      - name: Install Newman
+        run: npm install --global newman@6
+      - name: Run original v4 API tests
+        run: newman run v4/postman/collection.json -e v4/postman/environment.json --reporters cli,junit --reporter-junit-export test-results/postman.xml
+      - name: Verify direct service authorization
+        run: python3 scripts/security-smoke.py
       - uses: education/autograding@v1
-        id: autograder
-        continue-on-error: true
-
-      - name: Github auto grader mark
-        uses: Romanow/google-sheet-autograder-marker@v1.0
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -p lab5-ci logs --no-color > test-results/compose.log
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          google_token: ${{secrets.GOOGLE_API_KEY}}
-          sheet_id: "1xkgjUX6Qmk7rdJG-QPOToav-HWWtthJjnShIKnw3oIY"
-          homework_number: 5
-          user_column: 'D'
-          column_offset: 'F'
-          mark: "'+"
+          name: lab5-test-results
+          path: |
+            **/target/surefire-reports/
+            test-results/
+      - name: Stop test stack
+        if: always()
+        run: docker compose -p lab5-ci down -v

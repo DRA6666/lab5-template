@@ -1,0 +1,44 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/dra6666/lab5-reservation
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8070
+
+ingress:
+  enabled: false
+
+env:
+  - name: OIDC_ISSUER
+    value: "https://identity.example.com/realms/library"
+  - name: OIDC_JWKS_URI
+    value: "https://identity.example.com/realms/library/protocol/openid-connect/certs"
+  - name: OIDC_AUDIENCE
+    value: "library-api"
+  - name: SPRING_DATASOURCE_URL
+    value: "jdbc:postgresql://postgres-postgresql.rsoi.svc.cluster.local:5432/reservations"
+  - name: SPRING_DATASOURCE_USERNAME
+    value: "program"
+  - name: SPRING_DATASOURCE_PASSWORD
+    value: "test"
+
+livenessProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8070
+  initialDelaySeconds: 60
+  periodSeconds: 10
+  failureThreshold: 5
+
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8070
+  initialDelaySeconds: 40
+  periodSeconds: 5
+  failureThreshold: 5

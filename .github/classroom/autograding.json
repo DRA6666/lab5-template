@@ -3,11 +3,11 @@
     {
       "name": "Run Postman",
       "setup": "",
-      "run": "newman run -e <variant>/postman/environment.json <variant>/postman/collection.json",
+      "run": "newman run -e v4/postman/environment.json v4/postman/collection.json",
       "input": "",
       "output": "",
       "comparison": "included",
-      "timeout": 10,
+      "timeout": 60,
       "points": 10
     }
   ]

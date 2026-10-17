@@ -1,5 +1,39 @@
 # Лабораторная работа #5
 
+## Implementación de la variante v4: biblioteca
+
+Este repositorio parte de la aplicación del lab4 y protege el gateway y los tres servicios (library, rating y reservation) con JWT firmados por Keycloak. Cada servicio descarga y almacena las claves públicas JWKS y valida localmente firma, emisor, audiencia y fechas del token. El gateway reenvía el mismo bearer token a los servicios internos.
+
+### Ejecutar localmente
+
+Requisitos: Docker Desktop con Compose y Python 3.
+
+```sh
+docker compose up --build -d
+python scripts/wait-ready.py
+python scripts/security-smoke.py
+```
+
+La pila usa los puertos 38050 (rating), 38060 (library), 38070 (reservation), 38080 (gateway), 38090 (Keycloak) y 35432 (PostgreSQL), así puede convivir con los contenedores del lab4 que usan los puertos estándar. Se pueden cambiar con RATING_PORT, LIBRARY_PORT, RESERVATION_PORT, GATEWAY_PORT, KEYCLOAK_PORT y POSTGRES_PORT.
+
+La configuración local importa un realm de demostración con el usuario testmax / lab5-local-password y el cliente library-client / lab5-local-client-secret. No uses estas credenciales de ejemplo en una instalación pública. El entorno Postman para la variante v4 apunta al gateway local. Para ejecutar las pruebas originales:
+
+```sh
+newman run v4/postman/collection.json -e v4/postman/environment.json
+```
+
+Las API de los cuatro servicios responden 401 si falta el token o si este no es válido. Los endpoints de salud quedan públicos. La identidad se obtiene del claim preferred_username; enviar X-User-Name no cambia el usuario.
+
+### Proveedor OIDC fuera del entorno local
+
+Configura un proveedor OIDC con el flujo de contraseña habilitado, un cliente confidencial y un usuario de pruebas. El token de acceso debe contener la audiencia library-api. Configura OIDC_ISSUER, OIDC_JWKS_URI, OIDC_AUDIENCE y, en el gateway, OIDC_TOKEN_URI para que correspondan al proveedor. En Helm, cambia el host de ejemplo library.example.com por el dominio de tu clúster. No guardes secretos reales en Git: inyecta el secreto del cliente y las credenciales mediante el gestor de secretos del entorno.
+
+### Verificación
+
+GitHub Actions compila y ejecuta las pruebas unitarias de los cuatro módulos, levanta la pila Docker, ejecuta la colección original de Postman y comprueba que cada servicio rechaza peticiones anónimas, tokens incorrectos y la suplantación del usuario mediante X-User-Name.
+
+Para detener el entorno local: docker compose down. Para borrar también la base de datos local de prueba: docker compose down -v.
+
 ![GitHub Classroom Workflow](../../workflows/GitHub%20Classroom%20Workflow/badge.svg?branch=master)
 
 ## OAuth2 Authorization
